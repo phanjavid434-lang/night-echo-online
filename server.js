@@ -7,6 +7,7 @@ import { WebSocketServer } from "ws";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const port = Number(process.env.PORT || 8787);
+const readyTimeoutMs = Number(process.env.READY_TIMEOUT_MS || 45000);
 const rooms = new Map();
 
 const mime = {
@@ -22,7 +23,7 @@ const mime = {
 };
 
 function createLobby() {
-  return { phase: "ready", ready: new Map(), votes: new Map() };
+  return { phase: "ready", ready: new Map(), votes: new Map(), waitingSince: new Map() };
 }
 
 function roomFor(name) {
@@ -44,6 +45,13 @@ function roomIds(room) {
   return [...room.keys()];
 }
 
+function roomHostId(room) {
+  if (room.hostId && room.has(room.hostId)) return room.hostId;
+  const next = [...room.values()].sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0))[0];
+  room.hostId = next ? next.id : null;
+  return room.hostId;
+}
+
 function broadcast(room, payload, exceptId) {
   const message = JSON.stringify(payload);
   for (const [id, client] of room) {
@@ -52,16 +60,54 @@ function broadcast(room, payload, exceptId) {
   }
 }
 
+function armReadyTimers(room, now = Date.now(), resetUnready = false) {
+  const lobby = ensureLobby(room);
+  if (lobby.phase !== "ready") return false;
+  const ids = roomIds(room);
+  const hasReady = ids.some((id) => lobby.ready.get(id));
+  if (ids.length < 2 || !hasReady) {
+    for (const id of ids) if (!lobby.ready.get(id)) lobby.waitingSince.set(id, now);
+    return false;
+  }
+  for (const id of ids) {
+    if (lobby.ready.get(id)) {
+      lobby.waitingSince.delete(id);
+    } else if (resetUnready || !lobby.waitingSince.has(id)) {
+      lobby.waitingSince.set(id, now);
+    }
+  }
+  return true;
+}
+
+function kickClient(room, target, reason = "kicked", by = null) {
+  const kicked = room.get(target);
+  if (!kicked || kicked.ws.readyState !== kicked.ws.OPEN) return false;
+  kicked.ws.send(JSON.stringify({ type: "kicked", by, reason }));
+  kicked.ws.close(4001, reason);
+  return true;
+}
+
 function lobbyPayload(room) {
   const lobby = ensureLobby(room);
+  const ids = roomIds(room);
+  const now = Date.now();
+  const hasReady = ids.some((id) => lobby.ready.get(id));
   return {
     type: "lobby",
     phase: lobby.phase,
-    players: roomIds(room).map((id) => ({
-      id,
-      ready: !!lobby.ready.get(id),
-      vote: lobby.votes.has(id) ? lobby.votes.get(id) : null
-    }))
+    host: roomHostId(room),
+    players: ids.map((id) => {
+      const ready = !!lobby.ready.get(id);
+      const waitLeft = lobby.phase === "ready" && ids.length >= 2 && hasReady && !ready
+        ? Math.max(0, Math.ceil((readyTimeoutMs - (now - (lobby.waitingSince.get(id) || now))) / 1000))
+        : null;
+      return {
+        id,
+        ready,
+        vote: lobby.votes.has(id) ? lobby.votes.get(id) : null,
+        waitLeft
+      };
+    })
   };
 }
 
@@ -132,9 +178,12 @@ wss.on("connection", (ws, req) => {
   const id = randomUUID();
   const client = { id, ws, state: null, joinedAt: Date.now() };
   room.set(id, client);
+  if (!room.hostId || !room.has(room.hostId)) room.hostId = id;
   lobby.ready.set(id, false);
+  lobby.waitingSince.set(id, Date.now());
   lobby.votes.delete(id);
   if (lobby.phase !== "vote") lobby.phase = "ready";
+  armReadyTimers(room);
 
   ws.send(JSON.stringify({
     type: "welcome",
@@ -172,17 +221,31 @@ wss.on("connection", (ws, req) => {
       broadcast(room, { type: "enemies", id, e: msg.e, level: msg.level }, id);
       return;
     }
+    if (msg.type === "kick") {
+      const target = typeof msg.target === "string" ? msg.target : "";
+      if (!target || target === id || id !== roomHostId(room)) return;
+      kickClient(room, target, "kicked", id);
+      return;
+    }
     if (msg.type === "lobbyReady") {
       const lobby = ensureLobby(room);
-      lobby.ready.set(id, !!msg.ready);
+      const now = Date.now();
+      const hadReady = roomIds(room).some((playerId) => lobby.ready.get(playerId));
+      const ready = !!msg.ready;
+      lobby.ready.set(id, ready);
+      if (ready) lobby.waitingSince.delete(id);
+      else lobby.waitingSince.set(id, now);
       lobby.votes.delete(id);
       const ids = roomIds(room);
       const allReady = ids.length >= 2 && ids.every((playerId) => lobby.ready.get(playerId));
       if (allReady) {
         lobby.phase = "vote";
         lobby.votes.clear();
+        lobby.waitingSince.clear();
       } else {
         lobby.phase = "ready";
+        const hasReady = ids.some((playerId) => lobby.ready.get(playerId));
+        armReadyTimers(room, now, !hadReady && hasReady);
       }
       broadcastLobby(room);
       return;
@@ -202,6 +265,7 @@ wss.on("connection", (ws, req) => {
         lobby.phase = "playing";
         lobby.ready.clear();
         lobby.votes.clear();
+        lobby.waitingSince.clear();
         for (const playerId of ids) lobby.ready.set(playerId, false);
         broadcast(room, { type: "levelChosen", ...result });
         broadcastLobby(room);
@@ -212,7 +276,9 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     const lobby = ensureLobby(room);
     room.delete(id);
+    if (room.hostId === id) room.hostId = null;
     lobby.ready.delete(id);
+    lobby.waitingSince.delete(id);
     lobby.votes.delete(id);
     if (room.size === 0) {
       rooms.delete(roomName);
@@ -223,6 +289,20 @@ wss.on("connection", (ws, req) => {
     broadcastLobby(room);
   });
 });
+
+const readySweep = setInterval(() => {
+  const now = Date.now();
+  for (const room of rooms.values()) {
+    const lobby = ensureLobby(room);
+    if (lobby.phase !== "ready" || room.size < 2) continue;
+    if (!armReadyTimers(room, now)) continue;
+    for (const id of roomIds(room)) {
+      if (lobby.ready.get(id)) continue;
+      const since = lobby.waitingSince.get(id) || now;
+      if (now - since >= readyTimeoutMs) kickClient(room, id, "readyTimeout");
+    }
+  }
+}, 1000);
 
 const heartbeat = setInterval(() => {
   for (const ws of wss.clients) {
@@ -235,7 +315,10 @@ const heartbeat = setInterval(() => {
   }
 }, 15000);
 
-wss.on("close", () => clearInterval(heartbeat));
+wss.on("close", () => {
+  clearInterval(readySweep);
+  clearInterval(heartbeat);
+});
 
 server.listen(port, () => {
   console.log(`Night Echo online MVP: http://localhost:${port}`);

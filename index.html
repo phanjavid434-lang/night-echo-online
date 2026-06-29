@@ -142,9 +142,12 @@
   .lobbyPlayers { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:22px auto 0; max-width:520px; }
   .lobbyPlayer { min-height:74px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; border:1px solid rgba(120,180,255,.24); border-radius:8px; background:rgba(12,22,42,.58); }
   .lobbyPlayer.me { border-color:rgba(120,240,200,.58); box-shadow:0 0 18px rgba(80,220,190,.14); }
+  .lobbyPlayerTop { display:flex; align-items:center; justify-content:center; gap:8px; min-height:24px; }
   .lobbyPlayer span { font-size:13px; color:#dcebff; }
   .lobbyPlayer b { font:700 11px/1 ui-monospace,Menlo,monospace; letter-spacing:.16em; color:#7a93bb; }
   .lobbyPlayer.ready b, .lobbyPlayer.voted b { color:#78f0c8; }
+  .lobbyKickBtn { height:22px; padding:0 9px; border:1px solid rgba(255,120,120,.42); border-radius:999px; background:rgba(70,18,26,.58); color:#ffd7d7; cursor:pointer; font:700 10px/1 ui-monospace,Menlo,monospace; letter-spacing:.08em; }
+  .lobbyKickBtn:hover { border-color:rgba(255,150,150,.78); background:rgba(100,26,34,.76); }
   .lobbyActions { display:flex; justify-content:center; align-items:center; gap:12px; flex-wrap:wrap; margin-top:24px; }
   .voteGrid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; margin:22px auto 0; max-width:520px; }
   .levelVoteBtn { min-height:58px; border:1px solid rgba(120,180,255,.28); border-radius:8px; background:rgba(12,22,42,.68); color:#dcebff; cursor:pointer; font:800 18px/1 ui-monospace,Menlo,monospace; transition:transform .12s, border-color .2s, background .2s, box-shadow .2s; }
@@ -478,7 +481,7 @@
   const keys = {};
   let pointer = { active:false, x:0, y:0 };
   const joy = { active:false, id:null, ox:0, oy:0, kx:0, ky:0, dx:0, dy:0, R:60 };
-  const online = { ws:null, id:null, room:'echo', peers:new Map(), lastSent:0, sendEvery:16, interpDelay:74, remoteLead:0.05, maxHistory:32, seq:0, applyingTeamEvent:false, lobbyOpen:false, lobby:null, ready:false, vote:null, chosen:null, lastSnap:0, snapEvery:34, enemyInterpDelay:118, enemySnapMax:12, snapPrev:null, snapNext:null, enemySnaps:[], lastBossProg:null };
+  const online = { ws:null, id:null, room:'echo', peers:new Map(), lastSent:0, sendEvery:16, interpDelay:74, remoteLead:0.05, maxHistory:32, seq:0, applyingTeamEvent:false, lobbyOpen:false, lobby:null, ready:false, vote:null, chosen:null, notice:'', kicked:false, lastSnap:0, snapEvery:34, enemyInterpDelay:118, enemySnapMax:12, snapPrev:null, snapNext:null, enemySnaps:[], lastBossProg:null };
   const DOWN_TIME=9, REVIVE_TIME=2.5, REVIVE_R=60;
 
   function resetOnlineSnapshots(){
@@ -507,7 +510,7 @@
     if(online.ws && online.ws.readyState===WebSocket.CONNECTING){ renderOnlineLobby(); return; }
     const room = ((roomInputEl && roomInputEl.value) || 'echo').replace(/[^\w-]/g,'').slice(0,32) || 'echo';
     if(roomInputEl) roomInputEl.value = room;
-    online.room = room; online.peers.clear(); online.lobby=null; online.ready=false; online.vote=null;
+    online.room = room; online.peers.clear(); online.lobby=null; online.ready=false; online.vote=null; online.notice=''; online.kicked=false;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(proto+'//'+location.host+'/ws?room='+encodeURIComponent(room));
     online.ws = ws;
@@ -516,7 +519,7 @@
       setOnlineStatus('在线',true); sendOnlineState(true);
       if(online.lobbyOpen){ sendOnline('lobbyReady',{ready:false}); renderOnlineLobby(); }
     });
-    ws.addEventListener('close', ()=>{ if(online.ws===ws){ online.ws=null; online.id=null; online.peers.clear(); online.lobby=null; setOnlineStatus('离线',false); renderOnlineLobby(); } });
+    ws.addEventListener('close', ()=>{ if(online.ws===ws){ online.ws=null; online.id=null; online.peers.clear(); online.lobby=null; setOnlineStatus(online.kicked?'被踢出':'离线',false); renderOnlineLobby(); } });
     ws.addEventListener('error', ()=>{ setOnlineStatus('错误',false); renderOnlineLobby(); });
     ws.addEventListener('message', (event)=>{
       let msg=null; try{ msg=JSON.parse(event.data); }catch(e){ return; }
@@ -537,6 +540,10 @@
         handleLevelChosen(msg);
       } else if(msg.type==='enemies'){
         applyEnemySnapshot(msg);
+      } else if(msg.type==='kicked'){
+        online.kicked=true;
+        online.notice=msg.reason==='readyTimeout' ? '你超过 45 秒未准备，已被自动移出房间' : '你已被房主移出房间';
+        setOnlineStatus('已移出',false);
       } else if(msg.type==='leave'){
         online.peers.delete(msg.id); renderOnlineLobby();
       }
@@ -583,6 +590,7 @@
   }
   function isHost(){
     if(!isTeamOnline()) return true;
+    if(online.lobby && online.lobby.host) return online.id===online.lobby.host;
     let min=online.id;
     for(const id of online.peers.keys()) if(id<min) min=id;
     return online.id===min;
@@ -656,7 +664,7 @@
     }
   }
   function openOnlineLobby(){
-    online.lobbyOpen=true; online.ready=false; online.vote=null; online.chosen=null;
+    online.lobbyOpen=true; online.ready=false; online.vote=null; online.chosen=null; online.notice=''; online.kicked=false;
     if(onlineLobbyScreen) onlineLobbyScreen.classList.remove('hidden');
     renderOnlineLobby();
     connectOnline(true);
@@ -678,6 +686,10 @@
     online.vote=lv;
     sendOnline('levelVote',{level:lv});
     renderOnlineLobby();
+  }
+  function kickLobbyPlayer(id){
+    if(!id || id===online.id) return;
+    sendOnline('kick',{target:id});
   }
   function handleLevelChosen(msg){
     const lv=Math.max(1,Math.min(20,parseInt(msg.level,10)||1));
@@ -711,14 +723,18 @@
     const readyCount=players.filter(p=>p.ready).length;
     const votedCount=players.filter(p=>p.vote!=null).length;
     const room=(online.room || ((roomInputEl&&roomInputEl.value)||'echo')).replace(/[^\w-]/g,'').slice(0,32)||'echo';
-    const status=!connected ? '正在连接房间' : (players.length<2 ? '把链接发给好友，等对方进入同一房间' : (phase==='vote' ? '全部已确认，开始投票选关' : '每个人点击确认，全部确认后进入选关'));
+    const hostId=lobby.host || players.map(p=>p.id).filter(Boolean).sort()[0] || '';
+    const amHost=!!online.id && online.id===hostId;
+    const status=online.notice || (!connected ? '正在连接房间' : (players.length<2 ? '把链接发给好友，等对方进入同一房间' : (phase==='vote' ? '全部已确认，开始投票选关' : '每个人点击确认，全部确认后进入选关')));
     const playerHTML=(players.length?players:[{id:'waiting',ready:false,vote:null}]).map((p,idx)=>{
       const isMe=p.id===online.id;
       const ready=phase==='vote' || !!p.ready;
       const voted=p.vote!=null;
-      const name=p.id==='waiting'?'等待同伴':(isMe?'你':'同伴 '+idx);
-      const label=phase==='vote' ? (voted?'已投第 '+p.vote+' 层':'选择中') : (ready?'已确认':'待确认');
-      return '<div class="lobbyPlayer '+(isMe?'me ':'')+(ready?'ready ':'')+(voted?'voted':'')+'"><span>'+name+'</span><b>'+label+'</b></div>';
+      const name=p.id==='waiting'?'等待同伴':(isMe?(p.id===hostId?'你 · 房主':'你'):(p.id===hostId?'房主':'同伴 '+idx));
+      let label=phase==='vote' ? (voted?'已投第 '+p.vote+' 层':'选择中') : (ready?'已确认':'待确认');
+      if(phase==='ready' && !ready && p.waitLeft!=null) label='待确认 · '+p.waitLeft+'s';
+      const kick=amHost && !isMe && p.id!=='waiting' ? '<button class="lobbyKickBtn" data-kick="'+p.id+'">踢出</button>' : '';
+      return '<div class="lobbyPlayer '+(isMe?'me ':'')+(ready?'ready ':'')+(voted?'voted':'')+'"><div class="lobbyPlayerTop"><span>'+name+'</span>'+kick+'</div><b>'+label+'</b></div>';
     }).join('');
     let body='';
     if(phase==='vote'){
@@ -729,12 +745,13 @@
       }
       body='<div class="voteGrid">'+grid+'</div><div class="voteResult">'+(online.vote?'你已投第 '+online.vote+' 层，等待其他人投票':'点击一个关卡即投票；同票时服务器随机选一个')+'</div>';
     } else {
-      body='<div class="lobbyActions"><button class="start onlineStart" data-ready="'+(!online.ready)+'" '+(!connected?'disabled':'')+'>'+(online.ready?'取消确认':'确认准备')+'</button></div><p class="lobbySub">已确认 '+readyCount+' / '+Math.max(players.length,2)+'。至少两个人在房间里，并且全部确认后才会进入选关投票。</p>';
+      body='<div class="lobbyActions"><button class="start onlineStart" data-ready="'+(!online.ready)+'" '+(!connected?'disabled':'')+'>'+(online.ready?'取消确认':'确认准备')+'</button></div><p class="lobbySub">已确认 '+readyCount+' / '+Math.max(players.length,2)+'。有人确认后，未准备超过 45 秒会自动移出。</p>';
     }
     onlineLobbyScreen.innerHTML='<div class="lobbyShell"><div class="lobbyKicker">ONLINE ROOM</div><h1 class="lobbyTitle">准备房间<small>ECHO LINK</small></h1><div class="roomTag">房间 '+room+'</div><p class="lobbySub">'+status+'</p><div class="lobbyPlayers">'+playerHTML+'</div>'+body+'<div class="lobbyActions"><button class="start lobbyGhost" data-back="1">返回首屏</button></div></div>';
     const readyBtn=onlineLobbyScreen.querySelector('[data-ready]');
     if(readyBtn) readyBtn.addEventListener('click',()=>setLobbyReady(readyBtn.getAttribute('data-ready')==='true'));
     onlineLobbyScreen.querySelectorAll('[data-vote]').forEach(btn=>btn.addEventListener('click',()=>submitLevelVote(btn.getAttribute('data-vote'))));
+    onlineLobbyScreen.querySelectorAll('[data-kick]').forEach(btn=>btn.addEventListener('click',()=>kickLobbyPlayer(btn.getAttribute('data-kick'))));
     const backBtn=onlineLobbyScreen.querySelector('[data-back]');
     if(backBtn) backBtn.addEventListener('click',closeOnlineLobby);
   }
