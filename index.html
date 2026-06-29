@@ -478,8 +478,12 @@
   const keys = {};
   let pointer = { active:false, x:0, y:0 };
   const joy = { active:false, id:null, ox:0, oy:0, kx:0, ky:0, dx:0, dy:0, R:60 };
-  const online = { ws:null, id:null, room:'echo', peers:new Map(), lastSent:0, sendEvery:20, interpDelay:58, remoteLead:0.075, maxHistory:26, seq:0, applyingTeamEvent:false, lobbyOpen:false, lobby:null, ready:false, vote:null, chosen:null, lastSnap:0, snapEvery:50, snapPrev:null, snapNext:null, lastBossProg:null };
+  const online = { ws:null, id:null, room:'echo', peers:new Map(), lastSent:0, sendEvery:16, interpDelay:74, remoteLead:0.05, maxHistory:32, seq:0, applyingTeamEvent:false, lobbyOpen:false, lobby:null, ready:false, vote:null, chosen:null, lastSnap:0, snapEvery:34, enemyInterpDelay:118, enemySnapMax:12, snapPrev:null, snapNext:null, enemySnaps:[], lastBossProg:null };
   const DOWN_TIME=9, REVIVE_TIME=2.5, REVIVE_R=60;
+
+  function resetOnlineSnapshots(){
+    online.snapPrev=null; online.snapNext=null; online.enemySnaps=[]; online.lastBossProg=null;
+  }
 
   (function initRoomFromUrl(){
     const params = new URLSearchParams(location.search);
@@ -659,7 +663,7 @@
   }
   function closeOnlineLobby(){
     online.lobbyOpen=false; online.ready=false; online.vote=null;
-    online.snapPrev=null; online.snapNext=null; online.lastBossProg=null;
+    resetOnlineSnapshots();
     clearWorld();
     sendOnline('lobbyReady',{ready:false});
     if(onlineLobbyScreen) onlineLobbyScreen.classList.add('hidden');
@@ -824,16 +828,14 @@
       if(Math.hypot(pos.x-peer.x,pos.y-peer.y)>snapDist){
         peer.x=pos.x; peer.y=pos.y; peer.shadowX=pos.x; peer.shadowY=pos.y;
       }
-      const shadowFollow=1-Math.exp(-dt*44);
+      const shadowFollow=1-Math.exp(-dt*(pos.extrapolated?24:38));
       peer.shadowX += (pos.x-peer.shadowX)*shadowFollow;
       peer.shadowY += (pos.y-peer.shadowY)*shadowFollow;
-      const velFollow=1-Math.exp(-dt*18);
+      const velFollow=1-Math.exp(-dt*20);
       peer.renderVx += (pos.vx-peer.renderVx)*velFollow;
       peer.renderVy += (pos.vy-peer.renderVy)*velFollow;
-      peer.x += peer.renderVx*dt*0.72;
-      peer.y += peer.renderVy*dt*0.72;
       const dist=Math.hypot(peer.shadowX-peer.x,peer.shadowY-peer.y);
-      const correctionRate=(pos.extrapolated?17:24)+Math.min(14,dist/18);
+      const correctionRate=(pos.extrapolated?20:30)+Math.min(22,dist/16);
       const correction=1-Math.exp(-dt*correctionRate);
       peer.x += (peer.shadowX-peer.x)*correction;
       peer.y += (peer.shadowY-peer.y)*correction;
@@ -923,7 +925,7 @@
     state.lanternT=0; state.silenceT=0; state.dashT=0; state.devourDim=1;
     state.invuln=Math.max(state.invuln||0, 1.2);
     exitOpen=false; orbsGot=0; boss=null;
-    online.snapPrev=null; online.snapNext=null; online.lastBossProg=null;
+    resetOnlineSnapshots();
     player.down=false; player.dead=false; player.reviveProgress=0; player.deadTimer=DOWN_TIME;
     isBossLevel = (lv%5===0);
     theme = isBossLevel ? (bossKind(lv)==='shard' ? 'mirror' : (bossKind(lv)==='devour' ? 'flux' : 'abyss')) : levelTheme(lv);
@@ -2849,38 +2851,61 @@
   function applyEnemySnapshot(msg){
     if(!msg || msg.id===online.id || isHost()) return;
     const e=msg.e; if(!e || Number(msg.level)!==state.level) return;
+    const snap = { t:performance.now(), e };
     online.snapPrev = online.snapNext;
-    online.snapNext = { t:performance.now(), e };
+    online.snapNext = snap;
     if(!online.snapPrev) online.snapPrev = online.snapNext;
+    online.enemySnaps = online.enemySnaps || [];
+    online.enemySnaps.push(snap);
+    while(online.enemySnaps.length>online.enemySnapMax) online.enemySnaps.shift();
+    while(online.enemySnaps.length>2 && snap.t-online.enemySnaps[0].t>900) online.enemySnaps.shift();
   }
   function lerp(a,b,t){ return a+(b-a)*t; }
   function applyInterpolatedEnemies(){
-    if(isHost() || !online.snapNext) return;
-    const n=online.snapNext, p=online.snapPrev||n;
-    const delay=online.snapEvery+30;
-    const span=Math.max(1, n.t-p.t);
-    let a=(performance.now()-delay-p.t)/span;
-    a=Math.max(0,Math.min(1,a));
+    const snaps=online.enemySnaps&&online.enemySnaps.length ? online.enemySnaps : (online.snapNext?[online.snapPrev||online.snapNext,online.snapNext]:[]);
+    if(isHost() || !snaps.length) return;
+    const renderAt=performance.now()-online.enemyInterpDelay;
+    while(snaps.length>2 && snaps[1].t<renderAt-16) snaps.shift();
+    let p=snaps[0], n=snaps[0], a=0;
+    if(snaps.length>1){
+      p=snaps[snaps.length-2]; n=snaps[snaps.length-1];
+      for(let i=1;i<snaps.length;i++){
+        if(snaps[i].t>=renderAt){ p=snaps[i-1]; n=snaps[i]; break; }
+      }
+      const span=Math.max(1, n.t-p.t);
+      a=Math.max(0,Math.min(1.3,(renderAt-p.t)/span));
+    }
     const ne=n.e||{}, pe=p.e||{};
-    const blend=(narr,parr,oldArr,make)=>{
+    const blend=(narr,parr,oldArr,make,vxI,vyI)=>{
       narr=narr||[]; parr=parr||[]; oldArr=oldArr||[];
       const out=[];
       for(let i=0;i<narr.length;i++){
         const cur=narr[i], prev=parr[i];
         const o=make(cur,i,oldArr[i]||{});
-        if(prev){ o.x=lerp((Number(prev[0])||0)*W,(Number(cur[0])||0)*W,a); o.y=lerp((Number(prev[1])||0)*H,(Number(cur[1])||0)*H,a); }
+        if(prev){
+          const px=(Number(prev[0])||0)*W, py=(Number(prev[1])||0)*H;
+          const nx=(Number(cur[0])||0)*W, ny=(Number(cur[1])||0)*H;
+          if(a>1 && vxI!=null && vyI!=null){
+            const lead=Math.min(0.12,(a-1)*Math.max(1,n.t-p.t)/1000);
+            o.x=nx+(Number(cur[vxI])||0)*W*lead;
+            o.y=ny+(Number(cur[vyI])||0)*H*lead;
+          } else {
+            const aa=Math.max(0,Math.min(1,a));
+            o.x=lerp(px,nx,aa); o.y=lerp(py,ny,aa);
+          }
+        }
         out.push(o);
       }
       return out;
     };
-    shadows=blend(ne.shadows,pe.shadows,shadows,(x,i,old)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||11,vx:(Number(x[3])||0)*W,vy:(Number(x[4])||0)*H,light:Number(x[5])||old.light||0,frozen:!!x[6],wob:old.wob||0}));
-    hunters=blend(ne.hunters,pe.hunters,hunters,(x,i,old)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||10,lunge:Number(x[3])||0,vx:(Number(x[4])||0)*W,vy:(Number(x[5])||0)*H,light:Number(x[6])||old.light||0,frozen:!!x[7],wob:old.wob||0,tx:old.tx||0,ty:old.ty||0}));
-    patrollers=blend(ne.patrollers,pe.patrollers,patrollers,(x,i,old)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||9,vx:(Number(x[3])||0)*W,vy:(Number(x[4])||0)*H,light:Number(x[5])||old.light||0,frozen:!!x[6],trail:old.trail||[]}));
-    splitters=blend(ne.splitters,pe.splitters,splitters,(x,i,old)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||12,gen:Number(x[3])||0,vx:(Number(x[4])||0)*W,vy:(Number(x[5])||0)*H,light:Number(x[6])||old.light||0,frozen:!!x[7],hitCd:Number(x[8])||0,wob:old.wob||0}));
+    shadows=blend(ne.shadows,pe.shadows,shadows,(x,i,old)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||11,vx:(Number(x[3])||0)*W,vy:(Number(x[4])||0)*H,light:Number(x[5])||old.light||0,frozen:!!x[6],wob:old.wob||0}),3,4);
+    hunters=blend(ne.hunters,pe.hunters,hunters,(x,i,old)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||10,lunge:Number(x[3])||0,vx:(Number(x[4])||0)*W,vy:(Number(x[5])||0)*H,light:Number(x[6])||old.light||0,frozen:!!x[7],wob:old.wob||0,tx:old.tx||0,ty:old.ty||0}),4,5);
+    patrollers=blend(ne.patrollers,pe.patrollers,patrollers,(x,i,old)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||9,vx:(Number(x[3])||0)*W,vy:(Number(x[4])||0)*H,light:Number(x[5])||old.light||0,frozen:!!x[6],trail:old.trail||[]}),3,4);
+    splitters=blend(ne.splitters,pe.splitters,splitters,(x,i,old)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||12,gen:Number(x[3])||0,vx:(Number(x[4])||0)*W,vy:(Number(x[5])||0)*H,light:Number(x[6])||old.light||0,frozen:!!x[7],hitCd:Number(x[8])||0,wob:old.wob||0}),4,5);
     mirrors=blend(ne.mirrors,pe.mirrors,mirrors,(x,i,old)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||10,light:Number(x[3])||old.light||0,frozen:!!x[4],delay:old.delay||1.4,wob:old.wob||0}));
-    bossBullets=blend(ne.bullets,pe.bullets,bossBullets,(x)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||6,vx:(Number(x[3])||0)*W,vy:(Number(x[4])||0)*H,life:Number(x[5])||1,bounce:Number(x[6])||0}));
+    bossBullets=blend(ne.bullets,pe.bullets,bossBullets,(x)=>({x:(Number(x[0])||0)*W,y:(Number(x[1])||0)*H,r:Number(x[2])||6,vx:(Number(x[3])||0)*W,vy:(Number(x[4])||0)*H,life:Number(x[5])||1,bounce:Number(x[6])||0}),3,4);
     applyBossSnapshot(ne.boss);
-    if(boss && ne.boss && pe.boss){ boss.x=lerp((Number(pe.boss.x)||0)*W,(Number(ne.boss.x)||0)*W,a); boss.y=lerp((Number(pe.boss.y)||0)*H,(Number(ne.boss.y)||0)*H,a); }
+    if(boss && ne.boss && pe.boss){ const ba=Math.max(0,Math.min(1,a)); boss.x=lerp((Number(pe.boss.x)||0)*W,(Number(ne.boss.x)||0)*W,ba); boss.y=lerp((Number(pe.boss.y)||0)*H,(Number(ne.boss.y)||0)*H,ba); }
     if(Object.prototype.hasOwnProperty.call(ne,'exit')) exit=ne.exit?{x:(Number(ne.exit.x)||0)*W,y:(Number(ne.exit.y)||0)*H,r:Number(ne.exit.r)||24,pulse:Number(ne.exit.pulse)||0}:null;
     exitOpen=!!ne.exitOpen;
     updateHUD();
