@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -93,7 +94,7 @@ function chooseVote(lobby, ids) {
     tied: candidates.length > 1,
     candidates,
     votes: Object.fromEntries([...counts.entries()].sort((a, b) => a[0] - b[0])),
-    runSeed: crypto.randomUUID()
+    runSeed: randomUUID()
   };
 }
 
@@ -120,10 +121,15 @@ const server = createServer(async (req, res) => {
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (ws, req) => {
+  ws.isAlive = true;
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
+
   const url = new URL(req.url || "/ws", `http://${req.headers.host}`);
   const [roomName, room] = roomFor(url.searchParams.get("room"));
   const lobby = ensureLobby(room);
-  const id = crypto.randomUUID();
+  const id = randomUUID();
   const client = { id, ws, state: null, joinedAt: Date.now() };
   room.set(id, client);
   lobby.ready.set(id, false);
@@ -160,6 +166,10 @@ wss.on("connection", (ws, req) => {
     }
     if (msg.type === "teamEvent" && msg.event && typeof msg.event === "object") {
       broadcast(room, { type: "teamEvent", id, event: { ...msg.event, t: Date.now() } }, id);
+      return;
+    }
+    if (msg.type === "enemies" && msg.e && typeof msg.e === "object") {
+      broadcast(room, { type: "enemies", id, e: msg.e, level: msg.level }, id);
       return;
     }
     if (msg.type === "lobbyReady") {
@@ -213,6 +223,19 @@ wss.on("connection", (ws, req) => {
     broadcastLobby(room);
   });
 });
+
+const heartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, 15000);
+
+wss.on("close", () => clearInterval(heartbeat));
 
 server.listen(port, () => {
   console.log(`Night Echo online MVP: http://localhost:${port}`);
